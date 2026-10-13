@@ -12,6 +12,7 @@ import java.util.Map;
 
 public final class BearerApiClient {
     public static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final long DOWNSTREAM_HEARTBEAT_INTERVAL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
     private final BearerBuilder.SessionContext sess;
     private final HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(15)).build();
 
@@ -29,6 +30,11 @@ public final class BearerApiClient {
     }
 
     public void openStreamLines(String fullUrl, Object jsonBody, Map<String, String> extraHeaders, java.util.function.Consumer<String> onLine) throws Exception {
+        openStreamLines(fullUrl, jsonBody, extraHeaders, onLine, null);
+    }
+
+    public void openStreamLines(String fullUrl, Object jsonBody, Map<String, String> extraHeaders,
+                                java.util.function.Consumer<String> onLine, Runnable onHeartbeat) throws Exception {
         URI u = URI.create(fullUrl);
         String pathQuery = u.getRawPath();
         String pathSig = pathQuery.startsWith("/algo") ? pathQuery.substring("/algo".length()) : pathQuery;
@@ -60,7 +66,22 @@ public final class BearerApiClient {
         try (org.apache.hc.client5.http.impl.classic.CloseableHttpClient client = org.apache.hc.client5.http.impl.classic.HttpClients.custom().setDefaultRequestConfig(org.apache.hc.client5.http.config.RequestConfig.custom().setConnectTimeout(org.apache.hc.core5.util.Timeout.ofSeconds(15)).setResponseTimeout(org.apache.hc.core5.util.Timeout.ofMinutes(5)).build()).useSystemProperties().build()) {
             client.execute(post, (org.apache.hc.core5.http.io.HttpClientResponseHandler<Void>) response -> {
                 try {
-                    return execHandler(response, onLine);
+                    return execHandler(response, onLine, onHeartbeat);
+                } catch (org.apache.hc.core5.http.ConnectionClosedException cce) {
+                    // Upstream closed a chunked response early; log headers for debugging.
+                    System.err.println("[stream] upstream closed connection early: " + cce.getMessage());
+                    try {
+                        System.err.println("[stream] upstream status=" + response.getCode());
+                        for (org.apache.hc.core5.http.Header h : response.getHeaders()) {
+                            String name = h.getName();
+                            if (name == null) continue;
+                            String lname = name.toLowerCase();
+                            if (lname.contains("authorization") || lname.contains("cookie") || lname.contains("token")) continue;
+                            System.err.println("[stream] hdr " + name + ": " + h.getValue());
+                        }
+                    } catch (Exception ignore) {
+                    }
+                    throw cce;
                 } catch (java.io.IOException ioe) {
                     throw ioe;
                 } catch (InterruptedException ie) {
@@ -73,11 +94,41 @@ public final class BearerApiClient {
         }
     }
 
-    private Void execHandler(org.apache.hc.core5.http.ClassicHttpResponse response, java.util.function.Consumer<String> onLine) throws Exception {
+    public static final class UpstreamRateLimitException extends RuntimeException {
+        public final long resetTimeMs;
+        public final String upstreamCode;
+        public final int upstreamHttpStatus;
+
+        public UpstreamRateLimitException(String message, long resetTimeMs, String upstreamCode, int upstreamHttpStatus) {
+            super(message);
+            this.resetTimeMs = resetTimeMs;
+            this.upstreamCode = upstreamCode;
+            this.upstreamHttpStatus = upstreamHttpStatus;
+        }
+    }
+
+    private Void execHandler(org.apache.hc.core5.http.ClassicHttpResponse response,
+                             java.util.function.Consumer<String> onLine, Runnable onHeartbeat) throws Exception {
+                System.out.println("[stream] upstream status=" + response.getCode() + " reason=" + response.getReasonPhrase());
+                // headers and body are debug-level to avoid noisy logs
+                for (org.apache.hc.core5.http.Header h : response.getHeaders()) {
+                    String name = h.getName();
+                    if (name == null) continue;
+                    String lname = name.toLowerCase();
+                    if (lname.contains("authorization") || lname.contains("cookie") || lname.contains("token")) continue;
+                    if (Config.debug()) {
+                        System.out.println("[stream][debug] upstream hdr " + name + ": " + h.getValue());
+                    }
+                }
+
                 if (response.getCode() != 200) {
                     String errBody = org.apache.hc.core5.http.io.entity.EntityUtils.toString(response.getEntity());
+                    if (Config.debug()) {
+                        System.out.println("[stream][debug] upstream error body=" + errBody);
+                    }
                     throw new RuntimeException("HTTP " + response.getCode() + " " + errBody);
                 }
+
                 java.io.InputStream is = response.getEntity().getContent();
                 java.util.concurrent.BlockingQueue<Integer> queue = new java.util.concurrent.LinkedBlockingQueue<>();
                 final int SENTINEL_EOF = -1;
@@ -87,35 +138,112 @@ public final class BearerApiClient {
                         while ((b = is.read()) != -1) queue.put(b);
                         queue.put(SENTINEL_EOF);
                     } catch (Exception e) {
+                        System.err.println("[stream] reader error: " + e);
                         try { queue.put(SENTINEL_EOF); } catch (InterruptedException ignore) {}
                     }
                 }, "sse-reader");
                 reader.setDaemon(true);
                 reader.start();
                 java.io.ByteArrayOutputStream lineBuf = new java.io.ByteArrayOutputStream();
-                int idleMs = 0;
-                while (true) {
-                    Integer b = queue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
-                    if (b == null) {
-                        idleMs += 500;
-                        if (idleMs >= 3000) break;
-                        continue;
+                long nextHeartbeatAt = System.nanoTime() + DOWNSTREAM_HEARTBEAT_INTERVAL_NANOS;
+                try {
+                    while (true) {
+                        Integer b = queue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (onHeartbeat != null && System.nanoTime() >= nextHeartbeatAt) {
+                            onHeartbeat.run();
+                            nextHeartbeatAt = System.nanoTime() + DOWNSTREAM_HEARTBEAT_INTERVAL_NANOS;
+                        }
+                        if (b == null) {
+                            // The upstream SSE can be quiet for long stretches; do not treat silence as completion.
+                            // We only stop when we see EOF or the downstream heartbeat detects a disconnect.
+                            continue;
+                        }
+                        if (b == SENTINEL_EOF) break;
+                        if (b == '\n') {
+                            String line = lineBuf.toString(java.nio.charset.StandardCharsets.UTF_8);
+                            lineBuf.reset();
+                            if (line.endsWith("\r")) line = line.substring(0, line.length() - 1);
+                            if (!line.isEmpty()) {
+                                if (Config.debug()) {
+                                    System.out.println("[stream][debug] upstream line=" + line);
+                                }
+                                maybeThrowRateLimit(line);
+                                onLine.accept(line);
+                            }
+                        } else {
+                            lineBuf.write(b);
+                        }
                     }
-                    idleMs = 0;
-                    if (b == SENTINEL_EOF) break;
-                    if (b == '\n') {
-                        String line = lineBuf.toString(java.nio.charset.StandardCharsets.UTF_8);
-                        lineBuf.reset();
-                        if (line.endsWith("\r")) line = line.substring(0, line.length()-1);
-                        if (!line.isEmpty()) onLine.accept(line);
-                    } else {
-                        lineBuf.write(b);
+                    // flush any last partial line
+                    String last = lineBuf.toString(java.nio.charset.StandardCharsets.UTF_8);
+                    if (!last.isEmpty()) {
+                        if (last.endsWith("\r")) last = last.substring(0, last.length() - 1);
+                        if (!last.isEmpty()) {
+                            if (Config.debug()) {
+                                System.out.println("[stream][debug] upstream line=" + last);
+                            }
+                            maybeThrowRateLimit(last);
+                            onLine.accept(last);
+                        }
+                    }
+                } finally {
+                    try { is.close(); } catch (Exception ignore) {}
+                    reader.interrupt();
+                }
+                if (Config.debug()) {
+                    System.out.println("[stream][debug] read complete");
+                }
+                return null;
+    }
+
+    private void maybeThrowRateLimit(String line) {
+        if (line == null) return;
+        String trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) return;
+        String payload = trimmed.substring(5).trim();
+
+        try {
+            JsonNode wrapper = objectMapper.readTree(payload);
+            int statusCode = wrapper.path("statusCodeValue").asInt(0);
+            String status = wrapper.path("statusCode").asText("");
+            if (statusCode == 0 && status.isBlank()) {
+                return;
+            }
+
+            // Some upstreams tunnel an inner HTTP response inside SSE data.
+            String bodyStr = wrapper.path("body").asText("");
+            JsonNode bodyJson = null;
+            if (!bodyStr.isBlank()) {
+                try {
+                    bodyJson = objectMapper.readTree(bodyStr);
+                } catch (Exception ignore) {
+                }
+            }
+
+            String code = bodyJson == null ? "" : bodyJson.path("code").asText("");
+            String message = bodyJson == null ? "" : bodyJson.path("message").asText("");
+
+            // Observed: statusCodeValue=403 and body.code=115 with message containing agentLimitResetTime.
+            if ((statusCode == 403 || statusCode == 429) && "115".equals(code)) {
+                long resetMs = 0L;
+                if (message != null && !message.isBlank()) {
+                    try {
+                        JsonNode m = objectMapper.readTree(message);
+                        resetMs = m.path("agentLimitResetTime").asLong(0L);
+                    } catch (Exception ignore) {
                     }
                 }
-                reader.interrupt();
-                try { is.close(); } catch (Exception ignore) {}
-                System.out.println("[stream] read complete");
-                return null;
+                String msg = "Upstream rate-limited (code=115)";
+                if (resetMs > 0) {
+                    msg += ", resetTimeMs=" + resetMs;
+                }
+                throw new UpstreamRateLimitException(msg, resetMs, code, statusCode);
+            }
+        } catch (UpstreamRateLimitException e) {
+            throw e;
+        } catch (Exception ignore) {
+            // ignore parse errors; it's fine for normal SSE deltas
+        }
     }
 
     private JsonNode call(String method, String fullUrl, Object jsonBody, Map<String,String> extraHeaders) throws Exception {

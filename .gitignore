@@ -1,0 +1,12 @@
+.svn/
+.vscode/
+.claude/
+.serena/
+.idea/
+.cursor/
+.codegraph/
+logs/
+target/
+node_modules/
+config.yaml
+dependency-reduced-pom.xml

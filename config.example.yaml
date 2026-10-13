@@ -1,0 +1,13 @@
+# Copy to config.yaml and fill in your credentials, or set QODER_PAT / APP_API_KEYS.
+qoder:
+  # A single PAT or a list; empty falls back to QODER_PAT (comma-separated).
+  pat: []
+  base_prompt: ""
+  debug: false
+
+app:
+  host: "127.0.0.1"
+  port: 8080
+  # API keys accepted in Authorization: Bearer <key> or x-api-key.
+  # Empty falls back to APP_API_KEYS; without keys, the local API is open.
+  api_keys: []

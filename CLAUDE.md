@@ -23,9 +23,11 @@ qoder2api.bat
 
 JDK 17+ required (`JAVA_HOME` points to a JDK). The Dockerfile builds on `maven:3.9.9-temurin-17-alpine` and runs on `eclipse-temurin:17-jre-alpine`, exposing port 8963 (set via `QODER_HOST`/`QODER_PORT`).
 
-There are **no tests** in this repo. The Maven Wrapper is script-only (no `.mvn/wrapper/maven-wrapper.jar`); `mvnw.cmd` downloads Maven into `%USERPROFILE%\.m2\wrapper\`.
+Run `mvn test` for the JUnit session-expiry, concurrent-refresh, and HTTP/SSE authentication-recovery tests. The Maven Wrapper is script-only (no `.mvn/wrapper/maven-wrapper.jar`); `mvnw.cmd` downloads Maven into `%USERPROFILE%\.m2\wrapper\`.
 
 ## Configuration (`config.yaml`, read by `Config.java`)
+
+Copy `config.example.yaml` to `config.yaml` for local use. Real `config.yaml` credentials and generated `dependency-reduced-pom.xml` are ignored by Git. `QODER_HOST` / `QODER_PORT` environment variables or system properties override the bind address/port for Docker compatibility.
 
 All values can be overridden by environment variables — the env var name is the key uppercased with `.`/`-` → `_` (e.g. `qoder.pat` → `QODER_PAT`, `app.host` → `APP_HOST`). PAT resolution order in `OpenAiBridge.run()`: explicit arg → `config.yaml qoder.pat` → `QODER_PAT` system property → `QODER_PAT` env var. PAT is mandatory; the server refuses to start without it.
 
@@ -35,16 +37,17 @@ Key fields: `qoder.pat` (PAT), `qoder.base_prompt` (path to a base-prompt JSON t
 
 The request flow has two halves with different auth schemes. Understand both before changing auth or request-building code.
 
-### 1. Bootstrap: PAT → session credentials (per-process, once at startup)
+### 1. PAT pool: PAT → renewable session credentials
 
-`OpenAiBridge` constructor (`OpenAiBridge.java:29`) runs once:
-1. Generates a random `machineId` / `machineToken` / `machineType` triple.
+`OpenAiBridge` constructs a `PatPool`. Each request acquires a session, round-robin across configured PATs:
+1. Each PAT has a stable random `machineId` / `machineToken` / `machineType` triple for the process lifetime.
 2. `SignatureApiClient.exchangeJobToken(pat)` → POSTs to `center.qoder.sh/algo/api/v3/user/jobToken` with the **Signature auth scheme** (appcode `cosy`, MD5 signature over `appcode & SECRET & date`, body encoded via `QoderEncoding`). Returns identity fields (name, id, userType, securityOauthToken, refreshToken).
 3. `BearerBuilder.newSession(identity, machineId, machineToken, machineType)` → builds a `SessionContext`:
    - Generates a 16-byte AES `tempKey`.
    - `cosyKey` = RSA-encrypt(tempKey) with a hardcoded server public key (`BearerBuilder.SERVER_PUBKEY_PEM`).
    - `info` = AES-CBC-encrypt(authPayloadJson(identity), tempKey), then base64. The tempKey is both the AES key *and* the IV (zero-IV reuse by design — it's the upstream's protocol).
-4. Resulting `SessionContext` is held for the lifetime of the process and reused for every chat request.
+4. `PatPool` caches the session and its client together, checks `expireTime` (epoch seconds or milliseconds), and refreshes shortly before expiry. Missing expiry falls back to a 30-minute cache lifetime. Refresh is on demand, with a lock per PAT so concurrent requests share one renewal and other PATs remain accessible.
+5. All chat/Responses calls use `PatPool.openStreamLines`, which renews a rejected session and retries authentication once, only before any upstream SSE data has been delivered. HTTP/SSE 401 and explicit login/token failures on 403 trigger renewal; quota code 115 remains a rate limit. A failed login has a 30-second retry cooldown rather than permanently disabling the PAT. When the pool cannot log in, handlers return 503 rather than misreporting 429.
 
 Note: `JobTokenClient.java` duplicates the same jobToken exchange logic that `SignatureApiClient.exchangeJobToken` does — `SignatureApiClient` is the one actually wired into the constructor. `LocalAuth.java` reads machine-id/user creds from `~/.qoder/.auth` (a standalone diagnostic tool with its own `main`, not used by the server).
 

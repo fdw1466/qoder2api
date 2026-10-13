@@ -117,12 +117,14 @@ public final class OpenAiBridge {
 
             acquired = pool.acquire();
             if (acquired == null) {
-                // Every PAT is cooling down or failed.
+                // Every PAT is cooling down after a quota or login failure.
                 long reset = pool.earliestResetMs();
+                boolean loginFailure = pool.hasLoginFailure();
                 ObjectNode root = objectMapper.createObjectNode();
                 ObjectNode err = objectMapper.createObjectNode();
-                err.put("message", "All PATs in the pool are currently rate-limited. Please retry shortly.");
-                err.put("type", "rate_limit_error");
+                err.put("message", loginFailure ? "Upstream login temporarily unavailable. Please retry shortly."
+                        : "All PATs in the pool are currently rate-limited. Please retry shortly.");
+                err.put("type", loginFailure ? "qoder_auth_error" : "rate_limit_error");
                 if (reset > 0) {
                     err.put("reset_time_ms", reset);
                     err.put("reset_time_epoch_seconds", reset / 1000);
@@ -130,12 +132,11 @@ public final class OpenAiBridge {
                 root.set("error", err);
                 byte[] out = objectMapper.writeValueAsBytes(root);
                 ex.getResponseHeaders().add("Content-Type", "application/json");
-                ex.sendResponseHeaders(429, out.length);
+                ex.sendResponseHeaders(loginFailure ? 503 : 429, out.length);
                 ex.getResponseBody().write(out);
                 return;
             }
             BearerBuilder.SessionContext sess = acquired.session();
-            BearerApiClient bearerClient = acquired.client();
 
             ObjectNode body = templateBase.deepCopy();
             String nid = UUID.randomUUID().toString();
@@ -185,7 +186,7 @@ public final class OpenAiBridge {
                 OutputStream out = ex.getResponseBody();
                 StreamAccumulator accumulator = new StreamAccumulator(out, reqId, created, model, toolsEnabled);
                 int[] dataLineCount = {0};
-                bearerClient.openStreamLines(url, body, extraHeaders, line -> {
+                pool.openStreamLines(acquired, url, body, extraHeaders, line -> {
                     dataLineCount[0]++;
                     if (!line.startsWith("data:")) return;
                     BridgeDelta delta = extractDelta(line.substring(5).trim());
@@ -218,7 +219,7 @@ public final class OpenAiBridge {
                 StringBuilder reasoning = new StringBuilder();
                 ToolCallAccumulator toolCalls = new ToolCallAccumulator();
                 int[] dataLineCount = {0};
-                bearerClient.openStreamLines(url, body, extraHeaders, line -> {
+                pool.openStreamLines(acquired, url, body, extraHeaders, line -> {
                     dataLineCount[0]++;
                     if (!line.startsWith("data:")) return;
                     BridgeDelta delta = extractDelta(line.substring(5).trim());
@@ -343,20 +344,22 @@ public final class OpenAiBridge {
             acquired = pool.acquire();
             if (acquired == null) {
                 long reset = pool.earliestResetMs();
+                boolean loginFailure = pool.hasLoginFailure();
                 ObjectNode root = objectMapper.createObjectNode();
                 ObjectNode err = objectMapper.createObjectNode();
-                err.put("message", "All PATs in the pool are currently rate-limited. Please retry shortly.");
-                err.put("type", "rate_limit_error");
+                err.put("message", loginFailure ? "Upstream login temporarily unavailable. Please retry shortly."
+                        : "All PATs in the pool are currently rate-limited. Please retry shortly.");
+                err.put("type", loginFailure ? "qoder_auth_error" : "rate_limit_error");
                 if (reset > 0) {
                     err.put("reset_time_ms", reset);
                     err.put("reset_time_epoch_seconds", reset / 1000);
                 }
                 root.set("error", err);
-                writeJson(ex, 429, root);
+                writeJson(ex, loginFailure ? 503 : 429, root);
                 return;
             }
 
-            String reply = callUpstreamFullText(prompt, model, acquired.session(), acquired.client());
+            String reply = callUpstreamFullText(prompt, model, acquired);
 
             ObjectNode out = objectMapper.createObjectNode();
             out.put("id", "resp_" + UUID.randomUUID().toString().replace("-", ""));
@@ -400,7 +403,8 @@ public final class OpenAiBridge {
         }
     }
 
-    private String callUpstreamFullText(String prompt, String model, BearerBuilder.SessionContext sess, BearerApiClient bearerClient) throws Exception {
+    private String callUpstreamFullText(String prompt, String model, PatPool.Acquired acquired) throws Exception {
+        BearerBuilder.SessionContext sess = acquired.session();
         ObjectNode body = templateBase.deepCopy();
         String nid = UUID.randomUUID().toString();
         body.put("request_id", nid);
@@ -425,7 +429,7 @@ public final class OpenAiBridge {
         Map<String, String> extraHeaders = Map.of("x-model-key", model, "x-model-source", ((ObjectNode) body.path("model_config")).path("source").asText("system"));
 
         StringBuilder full = new StringBuilder();
-        bearerClient.openStreamLines(url, body, extraHeaders, line -> {
+        pool.openStreamLines(acquired, url, body, extraHeaders, line -> {
             if (!line.startsWith("data:")) return;
             BridgeDelta delta = extractDelta(line.substring(5).trim());
             if (delta.isEmpty()) return;

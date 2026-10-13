@@ -45,7 +45,7 @@ public final class Config {
         if (!configPath.toFile().exists()) {
             return new ConfigData(
                 new Qoder(patList(null), null, false),
-                new App("127.0.0.1", 8080, List.of()));
+                new App("127.0.0.1", 8080, strList(null, "APP_API_KEYS")));
         }
         try {
             Map<String, Object> yaml = yamlMapper.readValue(configPath.toFile(), Map.class);
@@ -64,7 +64,7 @@ public final class Config {
             System.err.println("[config] failed to load config.yaml: " + e.getMessage());
             return new ConfigData(
                 new Qoder(patList(null), null, false),
-                new App("127.0.0.1", 8080, List.of()));
+                new App("127.0.0.1", 8080, strList(null, "APP_API_KEYS")));
         }
     }
 

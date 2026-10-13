@@ -82,6 +82,8 @@ public final class BearerApiClient {
                     } catch (Exception ignore) {
                     }
                     throw cce;
+                } catch (UpstreamRateLimitException | UpstreamAuthenticationException upstream) {
+                    throw upstream;
                 } catch (java.io.IOException ioe) {
                     throw ioe;
                 } catch (InterruptedException ie) {
@@ -107,6 +109,12 @@ public final class BearerApiClient {
         }
     }
 
+    public static final class UpstreamAuthenticationException extends RuntimeException {
+        public UpstreamAuthenticationException(int status) {
+            super("Upstream session authentication failed (HTTP " + status + ")");
+        }
+    }
+
     private Void execHandler(org.apache.hc.core5.http.ClassicHttpResponse response,
                              java.util.function.Consumer<String> onLine, Runnable onHeartbeat) throws Exception {
                 System.out.println("[stream] upstream status=" + response.getCode() + " reason=" + response.getReasonPhrase());
@@ -126,6 +134,7 @@ public final class BearerApiClient {
                     if (Config.debug()) {
                         System.out.println("[stream][debug] upstream error body=" + errBody);
                     }
+                    throwUpstreamError(response.getCode(), errBody);
                     throw new RuntimeException("HTTP " + response.getCode() + " " + errBody);
                 }
 
@@ -167,7 +176,7 @@ public final class BearerApiClient {
                                 if (Config.debug()) {
                                     System.out.println("[stream][debug] upstream line=" + line);
                                 }
-                                maybeThrowRateLimit(line);
+                                maybeThrowUpstreamError(line);
                                 onLine.accept(line);
                             }
                         } else {
@@ -182,7 +191,7 @@ public final class BearerApiClient {
                             if (Config.debug()) {
                                 System.out.println("[stream][debug] upstream line=" + last);
                             }
-                            maybeThrowRateLimit(last);
+                            maybeThrowUpstreamError(last);
                             onLine.accept(last);
                         }
                     }
@@ -196,7 +205,7 @@ public final class BearerApiClient {
                 return null;
     }
 
-    private void maybeThrowRateLimit(String line) {
+    private void maybeThrowUpstreamError(String line) {
         if (line == null) return;
         String trimmed = line.trim();
         if (!trimmed.startsWith("data:")) return;
@@ -206,43 +215,50 @@ public final class BearerApiClient {
             JsonNode wrapper = objectMapper.readTree(payload);
             int statusCode = wrapper.path("statusCodeValue").asInt(0);
             String status = wrapper.path("statusCode").asText("");
+            if (statusCode == 0) {
+                if ("UNAUTHORIZED".equals(status)) statusCode = 401;
+                else if ("FORBIDDEN".equals(status)) statusCode = 403;
+                else if ("TOO_MANY_REQUESTS".equals(status)) statusCode = 429;
+            }
             if (statusCode == 0 && status.isBlank()) {
                 return;
             }
 
             // Some upstreams tunnel an inner HTTP response inside SSE data.
-            String bodyStr = wrapper.path("body").asText("");
-            JsonNode bodyJson = null;
-            if (!bodyStr.isBlank()) {
-                try {
-                    bodyJson = objectMapper.readTree(bodyStr);
-                } catch (Exception ignore) {
-                }
+            JsonNode body = wrapper.path("body");
+            throwUpstreamError(statusCode, body.isTextual() ? body.asText() : body.toString());
+            if (statusCode >= 400) {
+                throw new IllegalStateException("Upstream SSE error (HTTP " + statusCode + ")");
             }
-
-            String code = bodyJson == null ? "" : bodyJson.path("code").asText("");
-            String message = bodyJson == null ? "" : bodyJson.path("message").asText("");
-
-            // Observed: statusCodeValue=403 and body.code=115 with message containing agentLimitResetTime.
-            if ((statusCode == 403 || statusCode == 429) && "115".equals(code)) {
-                long resetMs = 0L;
-                if (message != null && !message.isBlank()) {
-                    try {
-                        JsonNode m = objectMapper.readTree(message);
-                        resetMs = m.path("agentLimitResetTime").asLong(0L);
-                    } catch (Exception ignore) {
-                    }
-                }
-                String msg = "Upstream rate-limited (code=115)";
-                if (resetMs > 0) {
-                    msg += ", resetTimeMs=" + resetMs;
-                }
-                throw new UpstreamRateLimitException(msg, resetMs, code, statusCode);
-            }
-        } catch (UpstreamRateLimitException e) {
+        } catch (UpstreamRateLimitException | UpstreamAuthenticationException | IllegalStateException e) {
             throw e;
         } catch (Exception ignore) {
             // ignore parse errors; it's fine for normal SSE deltas
+        }
+    }
+
+    private static void throwUpstreamError(int statusCode, String body) {
+        JsonNode json = null;
+        try {
+            json = objectMapper.readTree(body);
+        } catch (Exception ignore) {
+        }
+        String code = json == null ? "" : json.path("code").asText("");
+        String message = json == null ? body : json.path("message").asText(body);
+        if ((statusCode == 403 || statusCode == 429) && "115".equals(code)) {
+            long resetMs = 0;
+            try {
+                resetMs = objectMapper.readTree(message).path("agentLimitResetTime").asLong(0);
+            } catch (Exception ignore) {
+            }
+            throw new UpstreamRateLimitException("Upstream rate-limited (code=115)", resetMs, code, statusCode);
+        }
+        String lower = message.toLowerCase(java.util.Locale.ROOT);
+        boolean authMessage = lower.contains("unauthorized") || lower.contains("authentication")
+                || lower.contains("login") || lower.contains("登录") || lower.contains("令牌")
+                || (lower.contains("token") && (lower.contains("expir") || lower.contains("invalid")));
+        if (statusCode == 401 || (statusCode == 403 && authMessage)) {
+            throw new UpstreamAuthenticationException(statusCode);
         }
     }
 

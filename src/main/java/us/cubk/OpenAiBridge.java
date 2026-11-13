@@ -21,12 +21,26 @@ public final class OpenAiBridge {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
     private static final String MODELS_FILE = "models.json";
+    private static final String UPSTREAM_URL = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation"
+            + "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
 
     private final PatPool pool;
     private final JsonNode templateBase;
+    private final String upstreamUrl;
+    private final File modelsFile;
 
     public OpenAiBridge(List<String> pats, String basePromptFile) throws Exception {
-        this.pool = new PatPool(pats);
+        this(new PatPool(pats), basePromptFile, UPSTREAM_URL);
+    }
+
+    OpenAiBridge(PatPool pool, String basePromptFile, String upstreamUrl) throws Exception {
+        this(pool, basePromptFile, upstreamUrl, new File(MODELS_FILE));
+    }
+
+    OpenAiBridge(PatPool pool, String basePromptFile, String upstreamUrl, File modelsFile) throws Exception {
+        this.pool = pool;
+        this.upstreamUrl = upstreamUrl;
+        this.modelsFile = modelsFile;
         System.out.println("[bridge] PAT pool size=" + pool.size());
         String basePromptFilePath = (basePromptFile != null && !basePromptFile.isBlank()) ? basePromptFile : "baseprompt.json";
         String basePrompt = new String(java.nio.file.Files.readAllBytes(new File(basePromptFilePath).toPath()));
@@ -96,10 +110,11 @@ public final class OpenAiBridge {
             JsonNode req = objectMapper.readTree(ex.getRequestBody());
             boolean stream = req.path("stream").asBoolean(false);
             String model = req.path("model").asText(defaultModelKey());
+            String modelKey = resolveModelKey(model);
             JsonNode messages = req.path("messages");
 
             // basic request info
-            System.out.println("[bridge] /v1/chat/completions model=" + model + " stream=" + stream + " messages=" + (messages != null && messages.isArray() ? messages.size() : 0));
+            System.out.println("[bridge] /v1/chat/completions model=" + model + " modelKey=" + modelKey + " stream=" + stream + " messages=" + (messages != null && messages.isArray() ? messages.size() : 0));
             debugIncomingMessages(messages);
 
             // Accept any model key provided by client.
@@ -147,7 +162,7 @@ public final class OpenAiBridge {
             body.put("stream", stream);
             body.put("aliyun_user_type", sess.identity().userType());
             ObjectNode mc = (ObjectNode) body.path("model_config");
-            mc.put("key", model);
+            mc.put("key", modelKey);
             ObjectNode biz = (ObjectNode) body.path("business");
             biz.put("id", UUID.randomUUID().toString());
             biz.put("begin_at", System.currentTimeMillis());
@@ -172,9 +187,9 @@ public final class OpenAiBridge {
                 }
             }
 
-            String url = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation" + "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
-            Map<String, String> extraHeaders = Map.of("x-model-key", model, "x-model-source", mc.path("source").asText("system"));
-            System.out.println("[bridge] >>> upstream url=" + url);
+            String url = upstreamUrl;
+            Map<String, String> extraHeaders = Map.of("x-model-key", modelKey, "x-model-source", mc.path("source").asText("system"));
+            System.out.println("[bridge] >>> upstream url=" + url + " model_config.key=" + mc.path("key").asText() + " x-model-key=" + extraHeaders.get("x-model-key"));
 
             String reqId = "chatcmpl-" + UUID.randomUUID().toString().replace("-", "").substring(0, 24);
             long created = System.currentTimeMillis() / 1000;
@@ -291,20 +306,20 @@ public final class OpenAiBridge {
                 err.put("reset_time_epoch_seconds", rle.resetTimeMs / 1000);
             }
             root.set("error", err);
-            byte[] out = objectMapper.writeValueAsBytes(root);
             try {
-                ex.getResponseHeaders().add("Content-Type", "application/json");
-                ex.sendResponseHeaders(429, out.length);
-                ex.getResponseBody().write(out);
+                writeChatError(ex, 429, root);
+            } catch (IOException ignore) {
+            }
+        } catch (BearerApiClient.UpstreamResponseException e) {
+            try {
+                writeChatError(ex, e.status, upstreamError(e));
             } catch (IOException ignore) {
             }
         } catch (Exception e) {
-            String err = "{\"error\":{\"message\":\"" + e.getMessage().replace("\"", "\\\"") + "\",\"type\":\"qoder_error\"}}";
-            byte[] errBytes = err.getBytes(StandardCharsets.UTF_8);
+            ObjectNode root = objectMapper.createObjectNode();
+            root.putObject("error").put("message", String.valueOf(e.getMessage())).put("type", "qoder_error");
             try {
-                ex.getResponseHeaders().add("Content-Type", "application/json");
-                ex.sendResponseHeaders(500, errBytes.length);
-                ex.getResponseBody().write(errBytes);
+                writeChatError(ex, 500, root);
             } catch (IOException ignore) {
             }
         } finally {
@@ -314,6 +329,7 @@ public final class OpenAiBridge {
 
     private void handleResponses(HttpExchange ex) throws IOException {
         PatPool.Acquired acquired = null;
+        ResponsesStream responseStream = null;
         try {
             if (!"POST".equals(ex.getRequestMethod())) {
                 ex.sendResponseHeaders(405, -1);
@@ -322,20 +338,25 @@ public final class OpenAiBridge {
             if (!checkAuth(ex)) return;
             JsonNode req = objectMapper.readTree(ex.getRequestBody());
 
-            String model = req.path("model").asText("lite");
+            String model = req.path("model").asText(defaultModelKey());
+            String modelKey = resolveModelKey(model);
             boolean stream = req.path("stream").asBoolean(false);
 
             // basic request info
-            System.out.println("[bridge] /v1/responses model=" + model + " stream=" + stream);
+            System.out.println("[bridge] /v1/responses model=" + model + " modelKey=" + modelKey + " stream=" + stream);
             if (Config.debug()) {
                 System.out.println("[bridge][debug] responses incoming=" + abbreviateJson(req, 4000));
             }
-            if (stream) {
-                writeJsonError(ex, 400, "stream=true is not supported on /v1/responses yet. Please disable streaming.");
+            ArrayNode messages;
+            ArrayNode tools;
+            try {
+                messages = ResponsesRequest.messages(req);
+                tools = ResponsesRequest.tools(req);
+            } catch (IllegalArgumentException e) {
+                writeJsonError(ex, 400, e.getMessage());
                 return;
             }
-
-            String prompt = extractLatestInputText(req.path("input"));
+            String prompt = extractLatestUserPrompt(messages);
             if (prompt.isBlank()) {
                 writeJsonError(ex, 400, "No input text found. Expected input[].content[].text");
                 return;
@@ -359,29 +380,33 @@ public final class OpenAiBridge {
                 return;
             }
 
-            String reply = callUpstreamFullText(prompt, model, acquired);
-
-            ObjectNode out = objectMapper.createObjectNode();
-            out.put("id", "resp_" + UUID.randomUUID().toString().replace("-", ""));
-            out.put("object", "response");
-            out.put("created_at", System.currentTimeMillis() / 1000);
-            out.put("model", model);
-
-            ArrayNode output = objectMapper.createArrayNode();
-            ObjectNode msg = objectMapper.createObjectNode();
-            msg.put("id", "msg_" + UUID.randomUUID().toString().replace("-", ""));
-            msg.put("type", "message");
-            msg.put("role", "assistant");
-            ArrayNode content = objectMapper.createArrayNode();
-            ObjectNode item = objectMapper.createObjectNode();
-            item.put("type", "output_text");
-            item.put("text", reply);
-            content.add(item);
-            msg.set("content", content);
-            output.add(msg);
-            out.set("output", output);
-
-            writeJson(ex, 200, out);
+            ObjectNode body = buildResponsesBody(req, messages, tools, prompt, modelKey, acquired);
+            if (stream) {
+                ex.getResponseHeaders().set("Content-Type", "text/event-stream");
+                ex.getResponseHeaders().set("Cache-Control", "no-cache");
+                ex.sendResponseHeaders(200, 0);
+            }
+            ResponsesStream writer = new ResponsesStream(stream ? ex.getResponseBody() : null, model, req,
+                    tools.isEmpty() ? null : this::parseToolCallsText);
+            responseStream = writer;
+            writer.start();
+            Map<String, String> headers = Map.of("x-model-key", modelKey, "x-model-source", body.path("model_config").path("source").asText("system"));
+            System.out.println("[bridge] >>> upstream url=" + upstreamUrl + " model_config.key=" + body.path("model_config").path("key").asText() + " x-model-key=" + headers.get("x-model-key"));
+            pool.openStreamLines(acquired, upstreamUrl, body, headers, line -> {
+                if (!line.startsWith("data:")) return;
+                BridgeDelta delta = extractDelta(line.substring(5).trim());
+                try {
+                    writer.accept(delta.content(), delta.reasoningContent(), delta.toolCalls());
+                    writer.finishReason(delta.finishReason());
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            }, stream ? () -> {
+                try { writer.heartbeat(); }
+                catch (IOException e) { throw new java.io.UncheckedIOException(e); }
+            } : null);
+            ObjectNode result = writer.complete();
+            if (!stream) writeJson(ex, 200, result);
         } catch (BearerApiClient.UpstreamRateLimitException rle) {
             if (acquired != null) {
                 pool.markRateLimited(acquired.pat(), rle.resetTimeMs);
@@ -395,15 +420,25 @@ public final class OpenAiBridge {
                 err.put("reset_time_epoch_seconds", rle.resetTimeMs / 1000);
             }
             root.set("error", err);
-            writeJson(ex, 429, root);
+            writeResponsesError(ex, responseStream, 429, root);
+        } catch (BearerApiClient.UpstreamResponseException e) {
+            writeResponsesError(ex, responseStream, e.status, upstreamError(e));
         } catch (Exception e) {
-            writeJsonError(ex, 500, e.getMessage());
+            ObjectNode root = objectMapper.createObjectNode();
+            root.putObject("error").put("message", String.valueOf(e.getMessage())).put("type", "qoder_error");
+            writeResponsesError(ex, responseStream, 500, root);
         } finally {
             ex.close();
         }
     }
 
-    private String callUpstreamFullText(String prompt, String model, PatPool.Acquired acquired) throws Exception {
+    private void writeResponsesError(HttpExchange ex, ResponsesStream writer, int status, ObjectNode error) throws IOException {
+        if (writer != null && ex.getResponseCode() == 200) writer.fail(error.path("error"));
+        else writeJson(ex, status, error);
+    }
+
+    private ObjectNode buildResponsesBody(JsonNode request, ArrayNode messages, ArrayNode tools, String prompt,
+                                           String model, PatPool.Acquired acquired) {
         BearerBuilder.SessionContext sess = acquired.session();
         ObjectNode body = templateBase.deepCopy();
         String nid = UUID.randomUUID().toString();
@@ -411,7 +446,7 @@ public final class OpenAiBridge {
         body.put("chat_record_id", nid);
         body.put("request_set_id", UUID.randomUUID().toString());
         body.put("session_id", UUID.randomUUID().toString());
-        body.put("stream", false);
+        body.put("stream", request.path("stream").asBoolean(false));
         body.put("aliyun_user_type", sess.identity().userType());
         ((ObjectNode) body.path("model_config")).put("key", model);
         ObjectNode biz = (ObjectNode) body.path("business");
@@ -423,22 +458,19 @@ public final class OpenAiBridge {
         ((ObjectNode) ctx.path("text")).put("text", prompt);
         ((ObjectNode) ctx.path("extra").path("originalContent")).put("text", prompt);
 
-        body.set("messages", buildQoderMessages((ArrayNode) body.path("messages"), null, prompt, false));
-
-        String url = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation" + "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
-        Map<String, String> extraHeaders = Map.of("x-model-key", model, "x-model-source", ((ObjectNode) body.path("model_config")).path("source").asText("system"));
-
-        StringBuilder full = new StringBuilder();
-        pool.openStreamLines(acquired, url, body, extraHeaders, line -> {
-            if (!line.startsWith("data:")) return;
-            BridgeDelta delta = extractDelta(line.substring(5).trim());
-            if (delta.isEmpty()) return;
-            if (delta.content() != null && !delta.content().isEmpty()) {
-                full.append(delta.content());
-            }
-        });
-
-        return full.toString();
+        body.set("messages", buildQoderMessages((ArrayNode) body.path("messages"), messages, prompt, !tools.isEmpty()));
+        if (!tools.isEmpty()) body.set("tools", tools);
+        if (request.has("parallel_tool_calls")) body.set("parallel_tool_calls", request.get("parallel_tool_calls"));
+        if (request.hasNonNull("max_output_tokens")) {
+            body.withObject("/parameters").set("max_tokens", request.get("max_output_tokens"));
+        }
+        if (request.hasNonNull("tool_choice")) {
+            JsonNode choice = request.get("tool_choice");
+            if (choice.isObject() && "function".equals(choice.path("type").asText()) && choice.has("name")) {
+                body.putObject("tool_choice").put("type", "function").putObject("function").put("name", choice.path("name").asText());
+            } else body.set("tool_choice", choice.deepCopy());
+        }
+        return body;
     }
 
     private String extractLatestInputText(JsonNode input) {
@@ -510,11 +542,13 @@ public final class OpenAiBridge {
                     if (!src.path("enable").asBoolean(true)) continue;
                     String id = src.path("id").asText("");
                     if (id.isBlank()) continue;
+                    String name = src.path("name").asText("");
+                    String publicId = name.isBlank() ? id : name;
 
                     ObjectNode m = objectMapper.createObjectNode();
                     m.put("type", "model");
-                    m.put("id", id);
-                    m.put("display_name", src.path("display_name").asText(id));
+                    m.put("id", publicId);
+                    m.put("display_name", src.path("display_name").asText(publicId));
                     m.put("created_at", createdAt);
                     m.put("object", "model");
                     m.put("created", src.path("created").asLong(created));
@@ -603,6 +637,21 @@ public final class OpenAiBridge {
         return keys.isEmpty() ? List.of("lite") : keys;
     }
 
+    private String resolveModelKey(String model) {
+        JsonNode list = loadModelsConfig().path("data");
+        if (!list.isArray()) return model;
+        // Existing IDs take precedence if another model's name happens to match an ID.
+        for (JsonNode entry : list) {
+            if (model.equals(entry.path("id").asText())) return model;
+        }
+        for (JsonNode entry : list) {
+            if (!entry.path("enable").asBoolean(true)) continue;
+            String id = entry.path("id").asText("");
+            if (!id.isBlank() && model.equals(entry.path("name").asText())) return id;
+        }
+        return model;
+    }
+
     private String defaultModelKey() {
         JsonNode list = loadModelsConfig().path("data");
         if (!list.isArray()) return "lite";
@@ -621,7 +670,7 @@ public final class OpenAiBridge {
 
     private JsonNode loadModelsConfig() {
         try {
-            File f = new File(MODELS_FILE);
+            File f = modelsFile;
             if (!f.exists()) {
                 return objectMapper.createObjectNode();
             }
@@ -646,6 +695,29 @@ public final class OpenAiBridge {
         ex.getResponseBody().write(outBytes);
     }
 
+    private void writeChatError(HttpExchange ex, int status, JsonNode payload) throws IOException {
+        if (ex.getResponseCode() == 200 && "text/event-stream".equals(ex.getResponseHeaders().getFirst("Content-Type"))) {
+            // The SSE response is already open; changing HTTP status would discard the error.
+            OutputStream out = ex.getResponseBody();
+            out.write(("data: " + objectMapper.writeValueAsString(payload) + "\n\ndata: [DONE]\n\n")
+                    .getBytes(StandardCharsets.UTF_8));
+            out.flush();
+        } else {
+            writeJson(ex, status, payload);
+        }
+    }
+
+    private ObjectNode upstreamError(BearerApiClient.UpstreamResponseException e) {
+        ObjectNode root = objectMapper.createObjectNode();
+        ObjectNode error = root.putObject("error");
+        error.put("message", e.getMessage());
+        error.put("type", e.type);
+        error.put("code", e.code);
+        error.put("upstream_status", e.status);
+        if (e.details != null) error.set("details", e.details);
+        return root;
+    }
+
     private void writeJsonError(HttpExchange ex, int status, String message) throws IOException {
         ObjectNode root = objectMapper.createObjectNode();
         ObjectNode err = objectMapper.createObjectNode();
@@ -667,11 +739,12 @@ public final class OpenAiBridge {
                 String content = delta.has("content") ? delta.path("content").asText("") : "";
                 String reasoningContent = delta.has("reasoning_content") ? delta.path("reasoning_content").asText("") : "";
                 ArrayNode toolCalls = null;
+                String finishReason = ch.path("finish_reason").asText("");
                 if (delta.path("tool_calls").isArray() && delta.path("tool_calls").size() > 0) {
                     toolCalls = (ArrayNode) delta.path("tool_calls").deepCopy();
                 }
-                if (!role.isEmpty() || !content.isEmpty() || !reasoningContent.isEmpty() || toolCalls != null) {
-                    return new BridgeDelta(role, content, reasoningContent, toolCalls);
+                if (!role.isEmpty() || !content.isEmpty() || !reasoningContent.isEmpty() || toolCalls != null || !finishReason.isEmpty()) {
+                    return new BridgeDelta(role, content, reasoningContent, toolCalls, finishReason);
                 }
             }
         } catch (Exception ignore) {
@@ -808,17 +881,24 @@ public final class OpenAiBridge {
 
     private ArrayNode buildQoderMessages(ArrayNode templateMessages, JsonNode incomingMessages, String prompt, boolean toolsEnabled) {
         ArrayNode rebuilt = objectMapper.createArrayNode();
-        boolean keepTemplateSystem = !hasRole(incomingMessages, "system");
+        String systemText = "";
+        boolean keepTemplateSystem = !hasRole(incomingMessages, "system") && !hasRole(incomingMessages, "developer");
         if (keepTemplateSystem) {
             for (JsonNode msg : templateMessages) {
                 if ("system".equals(msg.path("role").asText())) {
-                    rebuilt.add(msg.deepCopy());
+                    systemText = joinSections(systemText, normalizeMessageText(msg));
                 }
             }
         }
         if (incomingMessages != null && incomingMessages.isArray()) {
             for (int i = 0; i < incomingMessages.size(); i++) {
                 JsonNode message = incomingMessages.get(i);
+                String role = message.path("role").asText();
+                if ("system".equals(role) || "developer".equals(role)) {
+                    // Providers behind Qoder may only accept one leading system message.
+                    systemText = joinSections(systemText, normalizeMessageText(message));
+                    continue;
+                }
                 boolean allowStructuredToolCalls = toolsEnabled && hasResolvedToolResponse(incomingMessages, i);
                 ObjectNode converted = convertIncomingMessage(message, toolsEnabled, allowStructuredToolCalls);
                 if (converted != null) {
@@ -828,6 +908,9 @@ public final class OpenAiBridge {
         }
         if (rebuilt.isEmpty() && !prompt.isBlank()) {
             rebuilt.add(buildUserMessage(prompt));
+        }
+        if (!systemText.isBlank()) {
+            rebuilt.insert(0, buildStructuredMessage("system", systemText));
         }
         return rebuilt;
     }
@@ -894,7 +977,7 @@ public final class OpenAiBridge {
             if ("tool".equals(nextRole)) {
                 return true;
             }
-            if ("assistant".equals(nextRole) || "user".equals(nextRole) || "system".equals(nextRole)) {
+            if ("assistant".equals(nextRole) || "user".equals(nextRole) || "system".equals(nextRole) || "developer".equals(nextRole)) {
                 return false;
             }
         }
@@ -1166,9 +1249,9 @@ public final class OpenAiBridge {
         out.flush();
     }
 
-    private record BridgeDelta(String role, String content, String reasoningContent, ArrayNode toolCalls) {
+    private record BridgeDelta(String role, String content, String reasoningContent, ArrayNode toolCalls, String finishReason) {
         private static BridgeDelta empty() {
-            return new BridgeDelta("", "", "", null);
+            return new BridgeDelta("", "", "", null, "");
         }
 
         private boolean isEmpty() {

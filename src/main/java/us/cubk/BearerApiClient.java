@@ -82,7 +82,7 @@ public final class BearerApiClient {
                     } catch (Exception ignore) {
                     }
                     throw cce;
-                } catch (UpstreamRateLimitException | UpstreamAuthenticationException upstream) {
+                } catch (UpstreamRateLimitException | UpstreamAuthenticationException | UpstreamResponseException upstream) {
                     throw upstream;
                 } catch (java.io.IOException ioe) {
                     throw ioe;
@@ -112,6 +112,21 @@ public final class BearerApiClient {
     public static final class UpstreamAuthenticationException extends RuntimeException {
         public UpstreamAuthenticationException(int status) {
             super("Upstream session authentication failed (HTTP " + status + ")");
+        }
+    }
+
+    public static final class UpstreamResponseException extends RuntimeException {
+        public final int status;
+        public final String code;
+        public final String type;
+        public final JsonNode details;
+
+        public UpstreamResponseException(int status, String message, String code, String type, JsonNode details) {
+            super(message);
+            this.status = status;
+            this.code = code;
+            this.type = type;
+            this.details = details;
         }
     }
 
@@ -227,10 +242,7 @@ public final class BearerApiClient {
             // Some upstreams tunnel an inner HTTP response inside SSE data.
             JsonNode body = wrapper.path("body");
             throwUpstreamError(statusCode, body.isTextual() ? body.asText() : body.toString());
-            if (statusCode >= 400) {
-                throw new IllegalStateException("Upstream SSE error (HTTP " + statusCode + ")");
-            }
-        } catch (UpstreamRateLimitException | UpstreamAuthenticationException | IllegalStateException e) {
+        } catch (UpstreamRateLimitException | UpstreamAuthenticationException | UpstreamResponseException e) {
             throw e;
         } catch (Exception ignore) {
             // ignore parse errors; it's fine for normal SSE deltas
@@ -259,6 +271,12 @@ public final class BearerApiClient {
                 || (lower.contains("token") && (lower.contains("expir") || lower.contains("invalid")));
         if (statusCode == 401 || (statusCode == 403 && authMessage)) {
             throw new UpstreamAuthenticationException(statusCode);
+        }
+        if (statusCode >= 400) {
+            String type = json == null ? "upstream_error" : json.path("type").asText("upstream_error");
+            JsonNode details = json == null ? null : json.get("details");
+            throw new UpstreamResponseException(statusCode,
+                    message.isBlank() ? "Upstream error (HTTP " + statusCode + ")" : message, code, type, details);
         }
     }
 

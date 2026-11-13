@@ -3,30 +3,27 @@
   "data": [
     {
       "id": "qmodel_38max",
+      "name": "Qwen3.8-Max",
       "owned_by": "qoder-bridge"
     },
     {
       "id": "kmodel_latest",
+      "name": "Kimi-K3.1-Pro",
       "owned_by": "qoder-bridge"
     },
     {
       "id": "dmodel",
-      "owned_by": "qoder-bridge"
-    },
-    {
-      "id": "dfmodel",
+      "name": "DeepSeek-V4-Pro",
       "owned_by": "qoder-bridge"
     },
     {
       "id": "gmodel",
+      "name": "GLM-5.3",
       "owned_by": "qoder-bridge"
     },
     {
       "id": "gfmodel",
-      "owned_by": "qoder-bridge"
-    },
-    {
-      "id": "smodel",
+      "name": "GLM-5.3-Flash",
       "owned_by": "qoder-bridge"
     }
   ]
